@@ -1,0 +1,88 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the correctness harness (tests/verify_main.cpp) and runs it on a simulated
+# NVIDIA H100 (https://github.com/pantheongpu/pantheonsim). The harness checks
+# the CPU reference, then the GPU wavefront and batched Smith-Waterman and
+# Needleman-Wunsch kernels against it, and exits non-zero on any failure. A
+# simulator cannot reproduce hardware-specific behavior or timing, so it
+# complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The project defaults to sm_75. The simulator runs PTX only (90-virtual)
+      # and needs a shared CUDA runtime.
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+
+      - name: Build
+        run: cmake --build build --target verify demo -j3
+
+      # verify returns 1 when any check fails, but the output is searched as
+      # well: a wrong-architecture run can print a VirtualGPU error and still
+      # exit 0. The simulator's per-launch counters show that the wavefront and
+      # batched kernels really ran on the device.
+      - name: Run the correctness tests
+        run: |
+          vgpu run --counters ./build/verify > verify.log 2>&1 || { tail -n 100 verify.log; exit 1; }
+          grep -E "^Layer|ran .* random|RESULT|ALL TESTS PASSED" verify.log
+          if grep -qiE "\[FAIL\]|THERE WERE FAILURES|VirtualGPU error|no device|no CUDA-capable|skipped" verify.log; then
+            echo "::error::the run reported a failure, a device problem or a skipped test"; exit 1
+          fi
+          grep -q "=== RESULT: [0-9]* passed, 0 failed ===" verify.log
+          grep -q "ALL TESTS PASSED" verify.log
+          for k in init_borders_kernel wavefront_diag_kernel batched_align_kernel; do
+            n=$(grep -c "\[vgpu\]\[counters\].*$k" verify.log || true)
+            echo "$k launches recorded by the simulator: $n"
+            test "$n" -ge 1
+          done
+
+      # The demo prints the device it found and checks CPU against GPU.
+      - name: Run the demo
+        run: |
+          vgpu run ./build/demo > demo.log 2>&1 || { tail -n 100 demo.log; exit 1; }
+          grep -E "Device 0:|Compute capability|VERIFY|correctness" demo.log
+          if grep -qE "MISMATCH|SOME CHECKS FAILED|VirtualGPU error|[Nn]o device|No CUDA-capable|[Ss]kipped" demo.log; then
+            echo "::error::the demo reported a mismatch or a device problem"; exit 1
+          fi
+          grep -q "Device 0: " demo.log
+          grep -q "All correctness checks PASSED" demo.log
